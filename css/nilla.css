@@ -1,0 +1,10 @@
+
+/*basic display utils*/
+.flex { display:flex; }
+.block { display: block; }
+.iblock { display:inline-block; }
+.hidden { display:none; }
+.flex-col { display:flex;flex-direction:column; }
+.flex-row { display:flex;flex-direction:row; }
+
+/*basic bordering*/
