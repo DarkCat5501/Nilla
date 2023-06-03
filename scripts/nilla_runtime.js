@@ -1,40 +1,42 @@
 //base overload  functions
 Array.prototype.end = function() { return this[this.length - 1]; }
 
-function singleUse(data) {
-	const used = {};
-	return new Proxy(data, {
-		has(target, key) { return !used[key] && key in target },
-		get(target, key) {
-			if (used[key] || !(key in target)) throw new Error(`Trying to access invalid value: ${key}`);
-			used[key] = true;
-			return data[key];
-		}
-	});
-}
-
 class Scope {
 	__properties;
 	__callbacks;
-	constructor(properties, nofallback = true, immutable = false) {
+	__used_vars;
+	constructor(properties, nofallback = false, immutable = false) {
 		this.__properties = properties;
 		this.__callbacks = new Map();
+		this.__used_vars = new Set();
 		this.props = new Proxy(properties, {
 			has: (target, key) => {
-				if (nofallback) return true;
+				if (!(["__CODE__", "eval"].includes(key))) this.__used_vars.add(key);
+				if (nofallback) return key in target
 				return (key in target) || (key in window);
 			},
 			get: (target, key) => {
-				if (typeof key === 'string') {
+				if (typeof key === "string") {
 					switch (key) {
 						default:
+							// console.log(key, target)
 							if (key in target) return target[key];
 							else if (key in window) return window[key];
 							else throw new ReferenceError(`Undefined varibale: ${key}`)
 					}
+				} else {
+					// switch (key) {
+					// 	case Symbol.unscopables: return new Proxy({}, {
+					// 		has: (_, key2) => console.log("has", key2),
+					// 		get: (_, key2) => console.log("get", key2, window, target),
+					// 		set: (_, key2) => console.log("set", key2)
+					// 	});
+					// 	default: console.log("looking for symbol:", key)
+					// }
 				}
 			},
 			set: (target, key, value) => {
+				// console.log("value", key)
 				if (immutable) return false;
 				target[key] = value;
 				if (this.__callbacks.has('__all')) {
@@ -52,6 +54,12 @@ class Scope {
 		this.props[prop] = value;
 	}
 
+	update() {
+		for (const [_, calss] of this.__callbacks) {
+			for (const cal of calss) cal();
+		}
+	}
+
 	force(prop, value) {
 		this.__properties[prop] = value;
 	}
@@ -65,6 +73,17 @@ class Scope {
 		}
 	};
 
+	static singleUseObject(data) {
+		const used = {};
+		return new Proxy(data, {
+			has(target, key) { return !used[key] && key in target },
+			get(target, key) {
+				if (used[key] || !(key in target)) throw new Error(`Trying to access invalid value: ${key}`);
+				used[key] = true;
+				return data[key];
+			}
+		});
+	}
 }
 
 const GlobalScope = new Scope(window, false);
@@ -72,9 +91,11 @@ const GlobalScope = new Scope(window, false);
 function safe_eval(code, context = {}, scope = {}) {
 	const globalScope = scope instanceof Scope ? scope : new Scope(scope, true);
 	globalScope.force("__CODE__", code);
+	globalScope.__used_vars.clear();
 	return {
 		result: (function() {
 			with (globalScope.props) {
+				"use strict"
 				return eval(__CODE__);
 			}
 		}).call(context),
@@ -82,7 +103,6 @@ function safe_eval(code, context = {}, scope = {}) {
 		scope: globalScope,
 	};
 }
-
 
 function requestFile(url, { method = "GET", params = undefined }, async = true) {
 	const requester = new XMLHttpRequest();
@@ -139,6 +159,7 @@ function deepAccess(obj, props) {
 Array.prototype.deepAccess = function(props) { return deepAccess(this, props); }
 Object.prototype.deepAccess = function(props) { return deepAccess(this, props); }
 
+
 function* range(start, end, step = 1) {
 	if (start && end === undefined) { end = start; start = 0; }
 	for (let i = start; i < end; i += step) yield i;
@@ -193,34 +214,98 @@ function evaluateDraw(target, context, scope) {
 };
 
 function cascadeTemplate(target, context, scope) {
-	if (target.nodeType === 3 /*#text*/) target.data = replaceTemplate(target.data, context, scope);//replace text nodes
+	if (target.nodeType === 3 /*#text*/) {
+		if (target.data.trim()) {
+			const dataBk = target.data;
+			const { value, vars } = replaceTemplate(target.data, context, scope);
+			target.data = value;
+			if (vars.size && !target.context) {
+				target.context = context
+				for (const vr of vars) {
+					context.addCallback(vr, () => {
+						target.data = dataBk;
+						cascadeTemplate(target, context, scope);
+					})
+				}
+			}
+		}
+	}//replace text nodes
 	else if (target.nodeType === 8/*#comment*/) { }
 	else {
 		//replace attributes
 		for (const attr of target.attributes) {
-			target.setAttribute(attr.name, replaceTemplate(attr.value, context, scope))
+			if (!attr.value) continue;
+			const attrValueBk = attr.value;
+			const { value, vars } = replaceAttrTemplate(attr.value, context, scope)
+
+			if (typeof value !== "string") {
+				target[attr.name] = value;
+				console.log("attr")
+			} else {
+				target.setAttribute(attr.name, value);
+				if (vars.size) {
+					for (const vr of vars) {
+						context.addCallback(vr, () => {
+							const { value } = replaceAttrTemplate(attrValueBk, context, scope)
+							target.setAttribute(attr.name, value);
+						})
+					}
+				}
+			}
+
 		}
 		evaluateElement(target, context, scope);
 	}
 }
 
-function replaceTemplate(template, context, scope) {
+function replaceAttrTemplate(template, context, scope) {
 	let templateData = template;
-	const templateMatcher = new RegExp(/{{([^{}]*)}}/g);
+	const templateMatcher = new RegExp(/{{(.*)}}/g);
 	//matches all properties and removes its ${}
 	const templated = (template.match(templateMatcher) || []).map(prop => prop.slice(2).slice(undefined, -2));
-	console.log("props:", templated)
 
+	const vars = new Set();
+	if (templated.length > 1) {
+		for (const tmpl of templated) {
+			try {
+				const res = safe_eval(tmpl, context, scope);
+				templateData = templateData.replace(`{{${tmpl}}}`, res.result);
+				vars.add(...res.scope.__used_vars);
+			} catch (e) {
+				console.error("TEMPLATE ERROR:", e);
+			}
+		}
+	} else {
+		try {
+			const res = safe_eval(templated[0], context, scope);
+			vars.add(...res.scope.__used_vars);
+			return { value: res.result, vars };
+		} catch (e) {
+			console.error("TEMPLATE ERROR:", e);
+		}
+
+	}
+	return { value: templateData, vars };
+}
+
+
+function replaceTemplate(template, context, scope) {
+	let templateData = template;
+	const templateMatcher = new RegExp(/{{(.*)}}/g);
+	//matches all properties and removes its ${}
+	const templated = (template.match(templateMatcher) || []).map(prop => prop.slice(2).slice(undefined, -2));
+
+	const vars = new Set();
 	for (const tmpl of templated) {
 		try {
 			const res = safe_eval(tmpl, context, scope);
 			templateData = templateData.replace(`{{${tmpl}}}`, res.result);
+			vars.add(...res.scope.__used_vars);
 		} catch (e) {
 			console.error("TEMPLATE ERROR:", e);
-			templateData = templateData.replace(`{{${tmpl}}}`, "{invalid}");
 		}
 	}
-	return templateData;
+	return { value: templateData, vars };
 }
 
 function evaluateElement(target, context, scope) {
@@ -370,17 +455,6 @@ function handleCustomElements(target, parent) {
 	}
 }
 
-const __SCRIPT_OBSERVER = new MutationObserver((ms) => {
-	for (const { target, addedNodes } of ms) {
-		if (target.tagName === "SCRIPT") {
-			for (const node of addedNodes) {
-				node.data = `with(GlobalScope.props){\n${node.data}\n};`;
-			}
-		}
-	}
-});
-
-//__SCRIPT_OBSERVER.observe(document, { subtree: true, childList: true });
 
 
 const __CUSTOM_OBSERVER = new MutationObserver((ms) => {
@@ -401,23 +475,100 @@ const __CUSTOM_OBSERVER = new MutationObserver((ms) => {
 
 const __GCTTCOPY = { data: "" };
 
-window.Rerender = function() {
-	document.children[0].innerHTML = __GCTTCOPY.data;
-	//evaluateElement(document.body, {}, GlobalScope);
-	for (const node of document.children[0].childNodes) {
-		if (node.nodeType === 3 /*#text*/) node.data = replaceTemplate(node.data, {}, GlobalScope);
-		else if (node.nodeType === 8 /*#comment*/) { }
-		else handleCustomElements(node, node.parentElement);
+// window.Rerender = function() {
+// 	document.children[0].innerHTML = __GCTTCOPY.data;
+// 	//evaluateElement(document.body, {}, GlobalScope);
+// 	for (const node of document.children[0].childNodes) {
+// 		if (node.nodeType === 3 /*#text*/) node.data = replaceTemplate(node.data, {}, GlobalScope);
+// 		else if (node.nodeType === 8 /*#comment*/) { }
+// 		else handleCustomElements(node, node.parentElement);
+// 	}
+// }
+
+function liveReload() {
+	if ('WebSocket' in window) {
+		(function() {
+			function refreshCSS() {
+				var sheets = [].slice.call(document.getElementsByTagName("link"));
+				var head = document.getElementsByTagName("head")[0];
+				for (var i = 0; i < sheets.length; ++i) {
+					var elem = sheets[i];
+					head.removeChild(elem);
+					var rel = elem.rel;
+					if (elem.href && typeof rel != "string" || rel.length == 0 || rel.toLowerCase() == "stylesheet") {
+						var url = elem.href.replace(/(&|\?)_cacheOverride=\d+/, '');
+						elem.href = url + (url.indexOf('?') >= 0 ? '&' : '?') + '_cacheOverride=' + (new Date().valueOf());
+					}
+					head.appendChild(elem);
+				}
+			}
+			var protocol = window.location.protocol === 'http:' ? 'ws://' : 'wss://';
+			var address = protocol + window.location.host + window.location.pathname + '/ws';
+			var socket = new WebSocket(address);
+			socket.onmessage = function(msg) {
+				if (msg.data == 'reload') window.location.reload();
+				else if (msg.data == 'refreshcss') refreshCSS();
+			};
+			console.log('Nilla live reload enabled.');
+		})();
 	}
 }
 
+liveReload();
+
+const __RUN_AFTER_LOAD = []
+//// Observers overwriting script tags ////
+const __SCRIPT_OBSERVER = new MutationObserver((ms) => {
+	for (const { target, addedNodes } of ms) {
+		if (target.tagName === "SCRIPT") {
+			for (const node of addedNodes) {
+				const scriptData = node.data;//.trim();
+				//node.data = "";
+				node.parentElement.removeChild(node);
+
+				//TODO: setup context based on parent element
+				if (scriptData.trim().startsWith("// <!")) continue;
+				else __RUN_AFTER_LOAD.push(scriptData);
+			}
+		}
+	}
+});
+
+__SCRIPT_OBSERVER.observe(document, { subtree: true, childList: true });
+
 window.addEventListener("load", () => {
+
+	for (const fn of __RUN_AFTER_LOAD) {
+		try {
+			//safe_eval("function teste(){ console.log('hello',a) }; teste()", {}, { a: 10 }, false);
+			safe_eval(fn, GlobalScope.props, { window: GlobalScope.props })
+		} catch (error) {
+			const { name, message, lineNumber, fileName, stack } = error;
+			console.log(name, message, lineNumber, fileName, stack);
+			//TODO: handle errors
+			// const { lineNumber } = error;
+			// const lines = scriptData.split('\n');
+			//
+			// const erro = [];
+			// for (const i of range(-2, 1)) {
+			// 	const line = lines[lineNumber + i];
+			// 	erro.push(`${lineNumber + i}:${line === '' ? ' ' : line}`)
+			// }
+
+			// console.log("lines:", lines);
+			// console.log(error.lineNumber, "INSIDE SCRIPT TAG")
+			// console.error("[Nilla error]", error);
+		}
+
+	}
+
 	__GCTTCOPY.data = document.children[0].innerHTML;
 	//evaluateElement(document.body, {}, GlobalScope);
 	for (const node of document.children[0].childNodes) {
-		if (node.nodeType === 3 /*#text*/) node.data = replaceTemplate(node.data, {}, GlobalScope);
-		else if (node.nodeType === 8 /*#comment*/) { }
-		else handleCustomElements(node, node.parentElement);
+		cascadeTemplate(node, GlobalScope, { window: GlobalScope });
 	}
 	__CUSTOM_OBSERVER.observe(document.children[0], { subtree: true, childList: true });
 })
+
+
+

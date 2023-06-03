@@ -23,10 +23,10 @@ export const requestRawFetch = async (url, params = {}, method = 'GET') => {
 /**
  * request a file
  **/
-export function requestFile(url, { method = "GET", params = undefined }, async = true) {
+export function requestFile(url, options = { method:"GET", params: undefined }, async = true) {
 	const requester = new XMLHttpRequest();
-	if (params != null) url += '?' + (new URLSearchParams(params)).toString();
-	requester.open(method || "GET", url, async);
+	if (options.params != null) url += '?' + (new URLSearchParams(options.params)).toString();
+	requester.open(options.method || "GET", url, async);
 	if (async) {
 		const output = new Promise((resolve, reject) => {
 			requester.onreadystatechange = ({ target: req }) => {
@@ -46,10 +46,10 @@ export function requestFile(url, { method = "GET", params = undefined }, async =
 				resolve(req);
 			}
 		})
-		requester.send(params);
+		requester.send(options.params);
 		return output;
 	}
-	requester.send(params);
+	requester.send(options.params);
 
 	return requester;
 };
